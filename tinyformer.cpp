@@ -6,17 +6,18 @@
 //   - xorshift RNG, Irwin-Hall approximate gaussian for init
 //   - bump allocator over one static float pool (no malloc)
 //   - full manual backprop: layernorm, causal multi-head attention, GELU MLP
-//   - Adam optimizer, char-level tokenizer, autoregressive sampling
+//   - Adam optimizer, byte-pair tokenizer, autoregressive sampling
 //   - checkpoint save/load, corpus loading from disk (raw syscall wrappers)
 //   - chat: special turn tokens, loss-masked finetuning, KV-cached REPL
 //
-// The only symbols borrowed from the outside world are printf and the raw
-// file-descriptor calls open/read/write/close, forward-declared by hand.
+// The only symbols borrowed from the outside world are printf, fflush, and
+// the raw file-descriptor calls open/read/write/close, forward-declared by hand.
 //
 // build:  g++ -O3 -march=native -ffast-math -o tinyformer tinyformer.cpp
 //
 // usage:
 //   ./tinyformer train    [steps] [corpus.txt]   pretrain, save tinyformer.ckpt
+//   ./tinyformer resume   [steps] corpus.txt     continue pretraining a ckpt
 //   ./tinyformer finetune [steps] dialog.txt     chat-tune an existing ckpt
 //   ./tinyformer sample   [nchars]               free-run generation from ckpt
 //   ./tinyformer chat                            interactive REPL from ckpt
@@ -30,6 +31,7 @@
 
 extern "C" {
     int  printf(const char* fmt, ...);
+    int  fflush(void* stream);           // fflush(0): flush training logs promptly
     int  open(const char* path, int flags, ...);
     long read(int fd, void* buf, unsigned long n);
     long write(int fd, const void* buf, unsigned long n);
@@ -82,6 +84,19 @@ static float f_log(float x) {
     return l + (float)e * 0.6931471805599453f;
 }
 
+// cos via folding to [0, pi/2] + Taylor (only needed for the lr schedule)
+static float f_cos(float x) {
+    const float PI = 3.14159265f;
+    if (x < 0.0f) x = -x;
+    while (x > 2.0f*PI) x -= 2.0f*PI;
+    if (x > PI) x = 2.0f*PI - x;
+    float sign = 1.0f;
+    if (x > 0.5f*PI) { x = PI - x; sign = -1.0f; }
+    float x2 = x*x;
+    return sign * (1.0f + x2*(-0.5f + x2*(0.041666668f
+                 + x2*(-0.001388889f + x2*0.0000248016f))));
+}
+
 static float f_tanh(float x) {
     if (x >  9.0f) return  1.0f;
     if (x < -9.0f) return -1.0f;
@@ -121,7 +136,7 @@ static float rnd_normal() {              // Irwin-Hall: 12 uniforms - 6 ~ N(0,1)
 // ---------------------------------------------------------------------------
 // memory: one static pool, bump allocator, no free (we never need one)
 // ---------------------------------------------------------------------------
-enum { POOL_FLOATS = 12000000 };
+enum { POOL_FLOATS = 48000000 };
 static float g_pool[POOL_FLOATS];
 static long  g_used = 0;
 
@@ -138,14 +153,14 @@ static void fzero(float* p, long n) { for (long i = 0; i < n; i++) p[i] = 0.0f; 
 // ---------------------------------------------------------------------------
 enum {
     T  = 128,       // context length
-    C  = 128,       // embedding width
-    L  = 4,         // transformer layers
+    C  = 256,       // embedding width
+    L  = 6,         // transformer layers
     H  = 8,         // attention heads
     HS = C / H,     // head size
     F  = 4 * C,     // MLP hidden width
     B  = 4,         // sequences per optimizer step (grad accumulation)
-    MAXV = 128,
-    CORPUS_MAX = 524288
+    MAXV = 1024,    // vocab cap: specials + chars + learned BPE merges
+    CORPUS_MAX = 8388608
 };
 
 // special tokens: fixed vocab slots, never produced by plain text
@@ -185,10 +200,15 @@ static long read_file(const char* path, char* buf, long maxn) {
 }
 
 // ---------------------------------------------------------------------------
-// tokenizer: character level + special turn tokens
+// tokenizer: characters + byte-pair merges + special turn tokens
+//   ids 0..2 are specials, then one id per character, then merged tokens.
+//   a merged token m stands for the pair (g_left[m], g_right[m]); chars and
+//   specials have g_left = -1. merges are applied in id order to encode.
 // ---------------------------------------------------------------------------
 static int  g_stoi[256];
-static char g_itos[MAXV];
+static char g_itos[MAXV];                // char for base tokens, 0 for merges
+static int  g_left[MAXV], g_right[MAXV];
+static char g_first[MAXV];               // first char of each token's text
 static int  V = 0;
 
 static int* g_data = 0;                  // tokenized training stream
@@ -201,7 +221,11 @@ static void vocab_reset() {
     for (int i = 0; i < 256; i++) g_stoi[i] = -1;
     V = 0;
     // specials occupy vocab ids 0..2; give them control-char byte identities
-    for (int s = 0; s < N_SPECIAL; s++) { g_itos[V] = (char)(s + 1); g_stoi[s + 1] = V; V++; }
+    for (int s = 0; s < N_SPECIAL; s++) {
+        g_itos[V] = g_first[V] = (char)(s + 1); g_stoi[s + 1] = V;
+        g_left[V] = g_right[V] = -1;
+        V++;
+    }
 }
 
 static int char_to_tok(unsigned char ch) {          // -1 if unknown
@@ -217,11 +241,71 @@ static void vocab_add_text(const char* text, long n) {
         if (ch == '\n') ch = ' ';                   // newlines become spaces
         if (g_stoi[ch] < 0) {
             if (V >= MAXV) continue;
-            g_itos[V] = (char)ch;
+            g_itos[V] = g_first[V] = (char)ch;
+            g_left[V] = g_right[V] = -1;
             g_stoi[ch] = V;
             V++;
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// byte-pair encoding
+// ---------------------------------------------------------------------------
+// specials never merge, and a space may only start a token (" the", not "the ")
+static bool mergeable(int a, int b) {
+    return a >= N_SPECIAL && b >= N_SPECIAL && g_first[b] != ' ';
+}
+
+// replace each (a, b) in the stream with m; text runs share one mask value
+static long merge_pass(int* tok, int* msk, long n, int a, int b, int m) {
+    long w = 0;
+    for (long r = 0; r < n; r++, w++) {
+        if (msk) msk[w] = msk[r];
+        if (r + 1 < n && tok[r] == a && tok[r + 1] == b) { tok[w] = m; r++; }
+        else tok[w] = tok[r];
+    }
+    return w;
+}
+
+// encode a char-level stream in place by replaying every merge in order
+static long bpe_encode(int* tok, int* msk, long n) {
+    for (int m = 0; m < V; m++)
+        if (g_left[m] >= 0) n = merge_pass(tok, msk, n, g_left[m], g_right[m], m);
+    return n;
+}
+
+static int g_paircnt[MAXV * MAXV];
+
+// grow the vocab to MAXV by repeatedly merging the most frequent pair,
+// encoding the stream as we go
+static long bpe_learn(int* tok, int* msk, long n) {
+    while (V < MAXV) {
+        for (int i = 0; i < V * MAXV; i++) g_paircnt[i] = 0;
+        for (long i = 0; i + 1 < n; i++)
+            if (mergeable(tok[i], tok[i + 1])) g_paircnt[tok[i] * MAXV + tok[i + 1]]++;
+        int best = -1, bestc = 1;
+        for (int i = 0; i < V * MAXV; i++)
+            if (g_paircnt[i] > bestc) { bestc = g_paircnt[i]; best = i; }
+        if (best < 0) break;                     // no pair occurs twice
+        int a = best / MAXV, b = best % MAXV, m = V++;
+        g_left[m] = a; g_right[m] = b; g_itos[m] = 0; g_first[m] = g_first[a];
+        n = merge_pass(tok, msk, n, a, b, m);
+        if (V % 128 == 0) { printf("bpe: vocab %d, stream %ld tokens\n", V, n); fflush(0); }
+    }
+    return n;
+}
+
+// expand a token to its text (at most cap chars); returns the length
+static int tok_text(int t, char* out, int cap) {
+    if (cap <= 0) return 0;
+    if (g_left[t] < 0) {
+        if (t < N_SPECIAL) return 0;
+        out[0] = g_itos[t];
+        return 1;
+    }
+    int k = tok_text(g_left[t], out, cap);
+    return k + tok_text(g_right[t], out + k, cap - k);
 }
 
 static void data_begin() {
@@ -619,45 +703,61 @@ static void adam_step(float lr) {
 }
 
 // ---------------------------------------------------------------------------
-// checkpoint: [magic][V T C L H][itos bytes][params]
+// checkpoint: [magic][V T C L H][itos bytes][left ints][right ints][params]
+//   char-level checkpoints (CKPT_CHAR) have no left/right tables
 // ---------------------------------------------------------------------------
 static const char* CKPT = "tinyformer.ckpt";
+enum { CKPT_CHAR = 0x54465632, CKPT_BPE = 0x54465633 };
 
 static bool save_ckpt(Params& P) {
     int fd = open(CKPT, 577, 420);       // O_WRONLY|O_CREAT|O_TRUNC, 0644
     if (fd < 0) return false;
-    int hdr[6] = { 0x54465632, V, T, C, L, H };
+    int hdr[6] = { CKPT_BPE, V, T, C, L, H };
     write(fd, hdr, sizeof(hdr));
     write(fd, g_itos, (unsigned long)V);
+    write(fd, g_left, (unsigned long)V * sizeof(int));
+    write(fd, g_right, (unsigned long)V * sizeof(int));
     write(fd, P.wte, (unsigned long)NP * sizeof(float));   // contiguous block
     close(fd);
     return true;
 }
 
-static bool load_ckpt_header() {          // fills V + vocab; params come later
+// open the checkpoint and read the vocab; leaves fd at the params (-1 on error)
+static int open_ckpt_vocab() {
     int fd = open(CKPT, 0);
-    if (fd < 0) return false;
+    if (fd < 0) return -1;
     int hdr[6];
-    if (read(fd, hdr, sizeof(hdr)) != sizeof(hdr)) { close(fd); return false; }
-    if (hdr[0] != 0x54465632 || hdr[2] != T || hdr[3] != C
+    if (read(fd, hdr, sizeof(hdr)) != sizeof(hdr)) { close(fd); return -1; }
+    if ((hdr[0] != CKPT_CHAR && hdr[0] != CKPT_BPE) || hdr[2] != T || hdr[3] != C
         || hdr[4] != L || hdr[5] != H || hdr[1] > MAXV) {
         printf("checkpoint does not match compiled config\n");
-        close(fd); return false;
+        close(fd); return -1;
     }
-    for (int i = 0; i < 256; i++) g_stoi[i] = -1;
     V = hdr[1];
     read(fd, g_itos, (unsigned long)V);
-    for (int i = 0; i < V; i++) g_stoi[(unsigned char)g_itos[i]] = i;
+    for (int i = 0; i < V; i++) g_left[i] = g_right[i] = -1;
+    if (hdr[0] == CKPT_BPE) {
+        read(fd, g_left, (unsigned long)V * sizeof(int));
+        read(fd, g_right, (unsigned long)V * sizeof(int));
+    }
+    for (int i = 0; i < 256; i++) g_stoi[i] = -1;
+    for (int i = 0; i < V; i++) {                // merges always follow their parts
+        if (g_left[i] < 0) { g_first[i] = g_itos[i]; g_stoi[(unsigned char)g_itos[i]] = i; }
+        else g_first[i] = g_first[g_left[i]];
+    }
+    return fd;
+}
+
+static bool load_ckpt_header() {          // fills V + vocab; params come later
+    int fd = open_ckpt_vocab();
+    if (fd < 0) return false;
     close(fd);
     return true;
 }
 
 static bool load_ckpt_params(Params& P) {
-    int fd = open(CKPT, 0);
+    int fd = open_ckpt_vocab();
     if (fd < 0) return false;
-    int hdr[6];
-    read(fd, hdr, sizeof(hdr));
-    read(fd, g_itos, (unsigned long)V);
     long want = NP * (long)sizeof(float), got = 0;
     char* dst = (char*)(void*)P.wte;
     while (got < want) {
@@ -760,6 +860,9 @@ static int sample_logits(const float* lg, float temp) {
 static void train(Params& P, Acts& A, int steps, float lr, int log_every) {
     int tok[T], tgt[T], msk[T];
     for (int step = 1; step <= steps; step++) {
+        // cosine decay: lr at step 1, lr/10 by the last step
+        float prog = (float)(step - 1) / (float)steps;
+        float lr_t = 0.1f*lr + 0.45f*lr*(1.0f + f_cos(3.14159265f * prog));
         fzero(g_base, NP);
         float loss = 0.0f;
         for (int b = 0; b < B; b++) {
@@ -778,9 +881,13 @@ static void train(Params& P, Acts& A, int steps, float lr, int log_every) {
             backward(P, A, tok, tgt, msk);
         }
         loss /= B;
-        adam_step(lr);
-        if (step == 1 || step % log_every == 0)
+        adam_step(lr_t);
+        if (step == 1 || step % log_every == 0) {
             printf("step %5d | loss %.4f\n", step, (double)loss);
+            fflush(0);
+        }
+        // periodic save so an interrupted run can be picked up with `resume`
+        if (step % 2000 == 0 && step < steps) save_ckpt(P);
     }
 }
 
@@ -789,16 +896,20 @@ static void generate(Params& P, Acts& A, int seed_tok, int nchars, float temp) {
     int hist[4096];
     int len = 0;
     hist[len++] = seed_tok;
-    if (seed_tok >= N_SPECIAL) printf("%c", g_itos[seed_tok]);
+    char txt[256];
+    int shown = tok_text(seed_tok, txt, 256);
+    printf("%.*s", shown, txt);
     int tok[T];
-    for (int n = 0; n < nchars; n++) {
+    while (shown < nchars) {
         int win = len < T ? len : T;
         int off = len - win;
         for (int t = 0; t < win; t++) tok[t] = hist[off + t];
         for (int t = win; t < T; t++) tok[t] = seed_tok;  // causal mask: harmless pad
         forward(P, A, tok, 0, 0);
         int pick = sample_logits(A.logits + (long)(win - 1) * V, temp);
-        if (pick >= N_SPECIAL) printf("%c", g_itos[pick]);
+        int k = tok_text(pick, txt, 256);
+        printf("%.*s", k, txt);
+        shown += k > 0 ? k : 1;              // specials print nothing; still count them
         if (len < 4096) hist[len++] = pick;
         else { for (int i = 1; i < 4096; i++) hist[i-1] = hist[i]; hist[4095] = pick; }
     }
@@ -839,10 +950,12 @@ static void chat(Params& P) {
         len = 0;
         if (len < CHAT_HIST - 600) {
             hist[len++] = TOK_USER;
+            int start = len;
             for (long i = 0; i < n; i++) {
                 int t = char_to_tok((unsigned char)line[i]);
                 if (t >= 0) hist[len++] = t;
             }
+            len = start + (int)bpe_encode(hist + start, 0, len - start);
             hist[len++] = TOK_END;
             hist[len++] = TOK_BOT;
         }
@@ -856,9 +969,10 @@ static void chat(Params& P) {
         wstr("bot: ");
         int pos = win, made = 0;
         while (pos < T && made < CHAT_MAXGEN) {
-            int pick = sample_logits(lg, 0.2f);   // low temp: tiny models ramble
+            int pick = sample_logits(lg, 0.4f);   // low-ish temp: varied replies, fewer garbled words
             if (pick == TOK_END) break;
-            if (pick >= N_SPECIAL) wch(g_itos[pick]);
+            char txt[256];
+            write(1, txt, (unsigned long)tok_text(pick, txt, 256));
             if (len < CHAT_HIST) hist[len++] = pick;
             lg = forward_one(P, pick, pos++);
             made++;
@@ -899,6 +1013,7 @@ static void build_dialog_data(const char* text, long n) {
         }
         i = j + 1;
     }
+    g_datalen = (int)bpe_encode(g_data, g_mask, g_datalen);
     data_ensure(8L * T);
 }
 
@@ -941,6 +1056,7 @@ int main(int argc, char** argv) {
         vocab_add_text(src, n);
         data_begin();
         data_push_text(src, n, 1);       // pretraining: loss on everything
+        g_datalen = (int)bpe_learn(g_data, g_mask, g_datalen);
         data_ensure(8L * T);
         setup_model(P, A);
         init_params(P);
@@ -950,6 +1066,22 @@ int main(int argc, char** argv) {
         if (save_ckpt(P)) printf("\nsaved %s\n", CKPT);
         printf("\n--- sample ---\n");
         generate(P, A, N_SPECIAL, 300, 0.8f);
+    }
+    else if (s_eq(mode, "resume")) {
+        if (argc < 4) { printf("usage: tinyformer resume [steps] corpus.txt\n"); return 1; }
+        int steps = parse_int(argv[2], 2000);
+        if (!load_ckpt_header()) { printf("no checkpoint. run train first.\n"); return 1; }
+        setup_model(P, A);
+        if (!load_ckpt_params(P)) { printf("checkpoint read failed\n"); return 1; }
+        long n = read_file(argv[3], g_text, CORPUS_MAX);
+        if (n <= 0) { printf("cannot read %s\n", argv[3]); return 1; }
+        data_begin();
+        data_push_text(g_text, n, 1);    // vocab is fixed by the ckpt: new chars drop
+        g_datalen = (int)bpe_encode(g_data, g_mask, g_datalen);
+        data_ensure(8L * T);
+        printf("resume: %d tokens | vocab %d | params %ld\n\n", g_datalen, V, NP);
+        train(P, A, steps, 0.001f, 250);
+        if (save_ckpt(P)) printf("\nsaved %s\n", CKPT);
     }
     else if (s_eq(mode, "finetune")) {
         if (argc < 4) { printf("usage: tinyformer finetune [steps] dialog.txt\n"); return 1; }
@@ -982,6 +1114,7 @@ int main(int argc, char** argv) {
         printf("tinyformer: pure C++ transformer, zero includes\n");
         printf("usage:\n");
         printf("  tinyformer train    [steps] [corpus.txt]   pretrain + save ckpt\n");
+        printf("  tinyformer resume   [steps] corpus.txt     continue pretraining ckpt\n");
         printf("  tinyformer finetune [steps] dialog.txt     chat-tune the ckpt\n");
         printf("  tinyformer sample   [nchars]               generate from ckpt\n");
         printf("  tinyformer chat                            interactive REPL\n");

@@ -16,8 +16,6 @@ import random
 import re
 import sys
 
-import pyarrow.parquet as pq
-
 MAX_USER = 180         # chat keeps the last 64 prompt tokens (~3 chars each with BPE)
 MAX_BOT = 200          # reply must fit in the remaining 128-token context
 MAX_BYTES = 8_000_000  # tinyformer reads at most CORPUS_MAX = 8388608 bytes
@@ -56,6 +54,8 @@ def write_capped(path, chunks):
 
 
 def main(corpus_out, pairs_out, *parquets):
+    import pyarrow.parquet as pq
+
     convos = []
     for path in parquets:
         for row in pq.read_table(path, columns=["utterances"]).to_pylist():

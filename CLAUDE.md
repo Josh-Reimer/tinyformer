@@ -6,11 +6,19 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A GPT-style transformer language model with a byte-pair tokenizer in a single file (`tinyformer.cpp`) with **zero `#include` directives** — no libc headers, no STL. This is the project's defining constraint: math functions (`f_exp`, `f_log`, `f_sqrt`, `f_tanh`, `f_cos`) are hand-rolled with bit tricks and series expansions, memory comes from a bump allocator over one static float pool (`falloc`, no free), and the only external symbols are `printf`, `fflush` and raw `open`/`read`/`write`/`close`, forward-declared in an `extern "C"` block. Preserve this constraint when editing — do not add includes or link in library functions.
 
+`tinyformer_gpu.cu` is the exception: the same model with ordinary includes and a CUDA training path (cuBLAS matmuls, simple one-thread-per-row/element kernels; sample and chat run on the host). It shares the checkpoint format, so checkpoints move freely between the two programs. It also builds with plain g++, where kernels run as serial loops via the `KERNEL`/`KID`/`LAUNCH` macros; that CPU build is the reference for checking the GPU build. Architecture or training changes to `tinyformer.cpp` must be mirrored there (its forward/backward is batched over `B*T` rows and keeps less per-layer state, so it is not a line-for-line copy).
+
 ## Commands
 
 ```sh
 # build
 g++ -O3 -march=native -ffast-math -o tinyformer tinyformer.cpp
+
+# GPU build (NVIDIA, CUDA 11.5+; use e.g. -arch=sm_86 on older nvcc) and CPU reference build of the same file
+nvcc -O3 -arch=native -o tinyformer_gpu tinyformer_gpu.cu -lcublas
+g++ -O3 -march=native -x c++ -o tinyformer_gpu tinyformer_gpu.cu
+
+# tinyformer_gpu takes the same modes and arguments, plus -b N (sequences per step; default 16 on GPU, 4 on CPU)
 
 # pretrain (uses built-in corpus if no file given), saves tinyformer.ckpt
 ./tinyformer train [steps] [corpus.txt]
@@ -45,7 +53,7 @@ All the data scripts share `make_dialog.py`'s `clean`/`ok` (lowercase, a fixed c
 
 Current best chat model: `bpe-pretrain10000-ds10000-ft3000.ckpt` — `bpe-pretrain10000.ckpt` (DailyDialog) resumed 10k steps on `corpus_deepseek.txt` (DeepSeek exchanges + facts), then finetuned 3k steps on `dialog_clean.txt` (DeepSeek + other-agent pairs, no DailyDialog); finetune loss 2.62. Finetunes on the old base all stalled at 3.3–3.6 whatever the data, so the base model's pretraining is the bottleneck, not finetune data. DailyDialog-heavy finetune data teaches non-answers ("yes, i think i will").
 
-There are no tests or linters. Verifying a change means rebuilding and running `train` (watch that loss falls) and/or `sample`/`chat`.
+There are no tests or linters. Verifying a change means rebuilding and running `train` (watch that loss falls) and/or `sample`/`chat`. To check `tinyformer_gpu.cu` against `tinyformer.cpp`, run both with `train 1` (`-b 4` for the GPU file) in separate scratch dirs on the same data: step-1 loss should match, and Adam's first update is ±lr·sign(grad), so diffing the two checkpoints per tensor exposes any wrong gradient (a few flips on near-zero grads such as key biases are float noise).
 
 ## Architecture
 
